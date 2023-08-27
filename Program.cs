@@ -30,28 +30,37 @@ abstract class CmdLine
 
     public abstract int Execute();
 
-    protected string git(string repo, params string[] args)
+    protected string git(string repo, byte[] stdin, params string[] args)
     {
         var arglist = new List<string>();
         arglist.Add(GitExe);
         arglist.Add("-c");
         arglist.Add("core.autocrlf=" + (AutoCrLf ? "true" : "false"));
         arglist.AddRange(args);
-        var output = CommandRunner.Run(arglist.ToArray()).WithWorkingDirectory(repo).OutputNothing().SuccessExitCodes(0).GoGetOutputText();
+        var runner = new CommandRunner();
+        runner.WorkingDirectory = repo;
+        runner.SetCommand(arglist);
+        runner.CaptureEntireStdout = true;
+        runner.CaptureEntireStderr = true;
+        runner.Start(stdin);
+        runner.EndedWaitHandle.WaitOne();
+        if (runner.ExitCode != 0)
+            throw new Exception($"Git command exited with status {runner.ExitCode}: " + runner.Command + "\r\n" + runner.EntireStderr.FromUtf8());
+        var output = runner.EntireStdout.FromUtf8();
         if (output.EndsWith("\r\n"))
             throw new Exception();
         return output;
     }
 }
 
-[CommandName("disassemble", "dis", "d")]
+[CommandName("disassemble", "d")]
 [Documentation("Disassemble a git repository into files and directories describing each commit in full.")]
 class CmdDisassemble : CmdLine
 {
-    [IsPositional]
+    [IsPositional, IsMandatory]
     [Documentation("Path to repository to disassemble.")]
     public string InputRepo = null;
-    [IsPositional]
+    [IsPositional, IsMandatory]
     [Documentation("Path where the disassembled repository files are output.")]
     public string OutputPath = null;
     [IsPositional]
@@ -72,18 +81,18 @@ class CmdDisassemble : CmdLine
 
     public override int Execute()
     {
-        var allrefs = splitNewlineTerminated(git(InputRepo, "show-ref")).Select(r => (id: r.Split(' ')[0], rf: r.Split(' ')[1])).ToList();
+        var allrefs = splitNewlineTerminated(git(InputRepo, null, "show-ref")).Select(r => (id: r.Split(' ')[0], rf: r.Split(' ')[1])).ToList();
         var ref2id = allrefs.ToDictionary(x => x.rf, x => x.id);
         var allheads = allrefs.Where(x => x.rf.StartsWith("refs/heads/")).ToList();
         var alltags = allrefs.Where(x => x.rf.StartsWith("refs/tags/")).ToList();
         Console.WriteLine($"Found {allrefs.Count} refs: " + allrefs.Select(x => x.rf).JoinString(", "));
 
-        var allobjects = splitNewlineTerminated(git(InputRepo, "cat-file", "--batch-check", "--batch-all-objects", "--unordered")).Select(r => r.Split(' ')).ToList();
+        var allobjects = splitNewlineTerminated(git(InputRepo, null, "cat-file", "--batch-check", "--batch-all-objects", "--unordered")).Select(r => r.Split(' ')).ToList();
         var commitIds = allobjects.Where(r => r[1] == "commit").Select(r => r[0]).ToList();
         Console.WriteLine($"Found {commitIds.Count} commit objects");
 
         Console.WriteLine($"Reading every commit...");
-        var commits = commitIds.AsParallel().WithDegreeOfParallelism(10).Select(cid => Commit.ParseRawCommit(cid, git(InputRepo, "cat-file", "-p", cid))).ToList();
+        var commits = commitIds.AsParallel().WithDegreeOfParallelism(10).Select(cid => Commit.ParseRawCommit(cid, git(InputRepo, null, "cat-file", "-p", cid))).ToList();
         Console.WriteLine($"Processing...");
         var nodes = commits.ToDictionary(c => c.Id, c => new CommitNode { Commit = c });
         foreach (var node in nodes.Values)
@@ -136,7 +145,7 @@ class CmdDisassemble : CmdLine
 
         // assign unique names that will replace commit hashes
         foreach (var c in discovered)
-            c.Commit.FileName = $"{time(c.Commit.AuthorTime):yyyy.MM.dd--HH.mm.sso<+HH.mm>}--{c.Commit.Id[..8]}--{msgpreview(c.Commit.Message)}";
+            c.Commit.DirName = $"{c.Commit.AuthorTime:yyyy.MM.dd--HH.mm.sso<+HH.mm>}--{c.Commit.Id[..8]}--{msgpreview(c.Commit.Message)}";
 
         // write out refs - just those that point at a discovered commit
         Directory.CreateDirectory(OutputPath);
@@ -146,36 +155,31 @@ class CmdDisassemble : CmdLine
                 continue;
             var path = Path.Combine(OutputPath, r.rf);
             Directory.CreateDirectory(Path.GetDirectoryName(path));
-            File.WriteAllText(path, nodes[r.id].Commit.FileName);
+            File.WriteAllText(path, nodes[r.id].Commit.DirName);
         }
 
         // write out commits
         foreach (var c in discovered)
         {
-            Console.WriteLine($"Writing {c.Commit.FileName}");
-            var path = Path.Combine(OutputPath, c.Commit.FileName);
+            Console.WriteLine($"Writing {c.Commit.DirName}");
+            var path = Path.Combine(OutputPath, c.Commit.DirName);
             Directory.CreateDirectory(path);
-            git(InputRepo, "worktree", "add", Path.Combine(path, "temptree"), c.Commit.Id);
+            git(InputRepo, null, "worktree", "add", Path.Combine(path, "temptree"), c.Commit.Id);
             Directory.Move(Path.Combine(path, "temptree"), Path.Combine(path, "tree"));
             File.Delete(Path.Combine(path, "tree", ".git"));
-            git(InputRepo, "worktree", "prune");
+            git(InputRepo, null, "worktree", "prune");
 
             File.WriteAllText(Path.Combine(path, "message.txt"), c.Commit.Message.JoinString("\r\n"));
             for (int pi = 0; pi < c.Parents.Count; pi++)
-                File.WriteAllText(Path.Combine(path, $"parent{pi}.txt"), c.Parents[pi].Commit.FileName);
+                File.WriteAllText(Path.Combine(path, $"parent{pi}.txt"), c.Parents[pi].Commit.DirName);
             File.WriteAllText(Path.Combine(path, "author.txt"), c.Commit.Author);
             if (c.Commit.Committer != c.Commit.Author)
                 File.WriteAllText(Path.Combine(path, "committer.txt"), c.Commit.Committer);
             if (c.Commit.CommitTime != c.Commit.AuthorTime)
-                File.WriteAllText(Path.Combine(path, "commit-time.txt"), $"{time(c.Commit.CommitTime):yyyy.MM.dd--HH.mm.sso<+HH.mm>}");
+                File.WriteAllText(Path.Combine(path, "commit-time.txt"), $"{c.Commit.CommitTime:yyyy.MM.dd--HH.mm.sso<+HH.mm>}");
         }
 
         return 0;
-    }
-
-    static OffsetDateTime time(Instant time)
-    {
-        return time.InZone(DateTimeZoneProviders.Bcl.GetSystemDefault()).ToOffsetDateTime();
     }
 
     static string[] splitNewlineTerminated(string lines)
@@ -200,17 +204,18 @@ class Commit
     public string Tree;
     public List<string> Parents = new();
     public string Author, Committer;
-    public Instant AuthorTime, CommitTime;
+    public OffsetDateTime AuthorTime, CommitTime;
     public List<string> Message = new();
-    public string FileName;
+    public string DirName;
+
+    public override string ToString() => $"{(Id ?? "").SubstringSafe(0, 8)} - {AuthorTime} - {Message.JoinString().SubstringSafe(0, 30)}";
 
     public static Commit ParseRawCommit(string id, string raw)
     {
-        Instant gtime(Match m)
+        OffsetDateTime gtime(Match m)
         {
-            var utc = Instant.FromUnixTimeSeconds(int.Parse(m.Groups["ud"].Value));
-            //var offset = int.Parse(m.Groups["tz"].Value);
-            return utc; // ignore offset, convert to a specific timezone on display
+            var utc = Instant.FromUnixTimeSeconds(int.Parse(m.Groups["ud"].Value)); // we don't preserve the original offset when reading
+            return utc.InZone(DateTimeZoneProviders.Bcl.GetSystemDefault()).ToOffsetDateTime();
         }
 
         var commit = new Commit();
