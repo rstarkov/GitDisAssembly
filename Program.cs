@@ -284,6 +284,7 @@ class CmdAssemble : CmdLine
             Console.WriteLine("Writing commit " + node.Commit.DirName);
             // Copy and commit tree
             cleanWorkdir(OutputRepo);
+            File.Delete(Path.Combine(OutputRepo, ".git", "index")); // force add -A to rebuild the index - otherwise we get wrong trees sometimes!
             copyContents(new DirectoryInfo(Path.Combine(InputPath, node.Commit.DirName, "tree")), new DirectoryInfo(OutputRepo));
             git(OutputRepo, null, "add", "-A");
             var treeId = git(OutputRepo, null, "write-tree").Trim();
