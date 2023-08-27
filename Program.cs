@@ -1,5 +1,6 @@
 using System.Text.RegularExpressions;
 using NodaTime;
+using NodaTime.Text;
 using RT.CommandLine;
 using RT.Util;
 using RT.Util.ExtensionMethods;
@@ -191,11 +192,151 @@ class CmdDisassemble : CmdLine
     }
 }
 
+[CommandName("assemble", "a")]
+[Documentation("Assemble a git repository from files and directories describing each commit.")]
+class CmdAssemble : CmdLine
+{
+    [IsPositional, IsMandatory]
+    public string InputPath = null;
+    [IsPositional, IsMandatory]
+    [Documentation("Path to the output repository. If this directory does not exist, a blank new repository is created automatically.")]
+    public string OutputRepo = null;
+
+    public override int Execute()
+    {
+        // Find commits
+        var nodes = new DirectoryInfo(InputPath).GetDirectories().Where(d => d.Name != "refs")
+            .ToDictionary(d => d.Name, d => new CommitNode { Commit = new() { DirName = d.Name } });
+
+        // Parse commits
+        var timePattern = OffsetDateTimePattern.CreateWithInvariantCulture("yyyy.MM.dd--HH.mm.sso<+HH.mm>");
+        string read(string path1, string path2)
+        {
+            var path = Path.Combine(InputPath, path1, path2);
+            return File.Exists(path) ? File.ReadAllText(path) : null;
+        }
+        foreach (var node in nodes.Values)
+        {
+            var commit = node.Commit;
+            var parsed = Regex.Match(commit.DirName, @"^(?<tm>\d\d\d\d\.\d\d\.\d\d--\d\d\.\d\d\.\d\d[+-]\d\d\.\d\d)--");
+            if (!parsed.Success)
+                throw new Exception("Cannot parse commit directory name: " + commit.DirName);
+            commit.AuthorTime = timePattern.Parse(parsed.Groups["tm"].Value).Value;
+            commit.Author = read(commit.DirName, "author.txt");
+            commit.Committer = read(commit.DirName, "committer.txt") ?? commit.Author;
+            commit.Author ??= commit.Committer;
+            if (commit.Author == null) throw new Exception("No author for commit: " + commit.DirName);
+            for (int i = 0; ; i++)
+            {
+                var parent = read(commit.DirName, $"parent{i}.txt");
+                if (parent == null) break;
+                commit.Parents.Add(parent);
+                if (!nodes.ContainsKey(parent)) throw new Exception($"Cannot resolve commit name '{parent}' used by parent{i} of '{commit.DirName}'.");
+                node.Parents.Add(nodes[parent]);
+                nodes[parent].Children.Add(node);
+            }
+            var commitTime = read(commit.DirName, "commit-time.txt");
+            if (commitTime == null)
+                commit.CommitTime = commit.AuthorTime;
+            else
+                commit.CommitTime = timePattern.Parse(commitTime).Value;
+            commit.Message = read(commit.DirName, "message.txt")?.Split("\r\n", "\n").ToList() ?? throw new Exception("No commit message for commit: " + commit.DirName);
+        }
+        // Parse refs
+        var refs = new List<(string name, CommitNode node)>();
+        void findRefs(DirectoryInfo dir, string name)
+        {
+            if (!dir.Exists) return;
+            foreach (var f in dir.EnumerateFiles())
+            {
+                var reftarget = read(dir.FullName, f.Name);
+                var refname = name + "/" + f.Name;
+                if (!nodes.ContainsKey(reftarget)) throw new Exception($"Cannot resolve commit name '{reftarget}' used by '{refname}'.");
+                refs.Add((refname, nodes[reftarget]));
+            }
+            foreach (var d in dir.EnumerateDirectories())
+                findRefs(d, name + "/" + d.Name);
+        }
+        findRefs(new DirectoryInfo(Path.Combine(InputPath, "refs")), "refs");
+
+        // Topological sort
+        var done = new HashSet<CommitNode>();
+        var sorted = new List<CommitNode>();
+        void add(CommitNode node)
+        {
+            if (done.Contains(node)) return;
+            foreach (var p in node.Parents)
+                add(p);
+            sorted.Add(node);
+            done.Add(node);
+        }
+        foreach (var node in nodes.Values)
+            add(node);
+
+        // Execute
+        if (!Directory.Exists(OutputRepo))
+        {
+            Directory.CreateDirectory(OutputRepo);
+            git(OutputRepo, null, "init", ".");
+        }
+        foreach (var node in sorted)
+        {
+            Console.WriteLine("Writing commit " + node.Commit.DirName);
+            // Copy and commit tree
+            cleanWorkdir(OutputRepo);
+            copyContents(new DirectoryInfo(Path.Combine(InputPath, node.Commit.DirName, "tree")), new DirectoryInfo(OutputRepo));
+            git(OutputRepo, null, "add", "-A");
+            var treeId = git(OutputRepo, null, "write-tree").Trim();
+            // Construct commit
+            var lines = new List<string>();
+            lines.Add("tree " + treeId);
+            foreach (var parent in node.Parents)
+            {
+                if (parent.Commit.Id == null) throw new Exception();
+                lines.Add("parent " + parent.Commit.Id);
+            }
+            lines.Add($"author {node.Commit.Author} {node.Commit.AuthorTime.ToInstant().ToUnixTimeSeconds()} {node.Commit.AuthorTime:o<+HHmm>}");
+            lines.Add($"committer {node.Commit.Committer} {node.Commit.CommitTime.ToInstant().ToUnixTimeSeconds()} {node.Commit.CommitTime:o<+HHmm>}");
+            lines.Add("");
+            lines.AddRange(node.Commit.Message);
+            // Write commit object
+            node.Commit.Id = git(OutputRepo, lines.JoinString("\n").ToUtf8(), "hash-object", "-t", "commit", "-w", "--stdin").Trim();
+            Console.WriteLine("    " + node.Commit.Id);
+        }
+        // Write refs
+        Console.WriteLine("Writing refs...");
+        foreach (var r in refs)
+            git(OutputRepo, null, "update-ref", r.name, r.node.Commit.Id);
+
+        void cleanWorkdir(string path)
+        {
+            var dir = new DirectoryInfo(path);
+            foreach (var file in dir.EnumerateFiles())
+                file.Delete();
+            foreach (var d in dir.EnumerateDirectories())
+                if (d.Name != ".git")
+                    d.Delete(recursive: true);
+        }
+        void copyContents(DirectoryInfo from, DirectoryInfo to)
+        {
+            to.Create();
+            foreach (var file in from.EnumerateFiles())
+                file.CopyTo(Path.Combine(to.FullName, file.Name), overwrite: false); // we only copy into clean directories
+            foreach (var dir in from.EnumerateDirectories())
+                copyContents(dir, new DirectoryInfo(Path.Combine(to.FullName, dir.Name)));
+        }
+
+        return 0;
+    }
+}
+
 class CommitNode
 {
     public Commit Commit;
-    public List<CommitNode> Parents;
+    public List<CommitNode> Parents = new();
     public List<CommitNode> Children = new();
+
+    public override string ToString() => $"node: {Commit}";
 }
 
 class Commit
