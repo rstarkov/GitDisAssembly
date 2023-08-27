@@ -1,6 +1,6 @@
-﻿using System.Text;
-using System.Text.RegularExpressions;
+﻿using System.Text.RegularExpressions;
 using NodaTime;
+using RT.CommandLine;
 using RT.Util;
 using RT.Util.ExtensionMethods;
 
@@ -8,27 +8,59 @@ namespace GitPatchDisAssemble;
 
 class Program
 {
-    static string Git = @"C:\Apps\Git\cmd\git.exe";
-    static string Repo;
+    static CmdLine Args;
 
     static void Main(string[] args)
     {
-        Repo = args[0];
-        var to = args[1];
-        var from = args[2]; // should really accept multiple
+        Args = CommandLineParser.ParseOrWriteUsageToConsole<CmdLine>(args);
+        if (Args == null)
+            return;
+        Args.Execute();
+    }
+}
 
-        Console.WriteLine($"Processing...");
-        var allrefs = splitNewlineTerminated(git("show-ref")).Select(r => (id: r.Split(' ')[0], rf: r.Split(' ')[1])).ToList();
+[CommandLine]
+abstract class CmdLine
+{
+    [Option("-ge", "--git-executable")]
+    public string GitExe = @"C:\Apps\Git\cmd\git.exe";
+
+    public abstract int Execute();
+
+    protected string git(string repo, params string[] args)
+    {
+        var output = CommandRunner.Run(new[] { GitExe }.Concat(args).ToArray()).WithWorkingDirectory(repo).OutputNothing().SuccessExitCodes(0).GoGetOutputText();
+        if (output.EndsWith("\r\n"))
+            throw new Exception();
+        return output;
+    }
+}
+
+[CommandName("dis", "d")]
+class CmdDisassemble : CmdLine
+{
+    [IsPositional]
+    public string InputRepo = null;
+    [IsPositional]
+    public string OutputPath = null;
+    [IsPositional]
+    public string[] AdditionalRefs = null;
+
+    // customization todo: folder name template; whether to use author or commit time for folders
+
+    public override int Execute()
+    {
+        var allrefs = splitNewlineTerminated(git(InputRepo, "show-ref")).Select(r => (id: r.Split(' ')[0], rf: r.Split(' ')[1])).ToList();
         var ref2id = allrefs.ToDictionary(x => x.rf, x => x.id);
-        //var id2ref = allrefs.ToDictionary(x => x.id, x => x.rf);
-        var fromId = ref2id.ContainsKey(from) ? ref2id[from] : from;
+        Console.WriteLine($"Found {allrefs.Count} refs: " + allrefs.Select(x => x.rf).JoinString(", "));
+        var fromIds = AdditionalRefs.Select(r => ref2id.ContainsKey(r) ? ref2id[r] : r).ToList();
 
-        var allobjects = splitNewlineTerminated(git("cat-file", "--batch-check", "--batch-all-objects", "--unordered")).Select(r => r.Split(' ')).ToList();
+        var allobjects = splitNewlineTerminated(git(InputRepo, "cat-file", "--batch-check", "--batch-all-objects", "--unordered")).Select(r => r.Split(' ')).ToList();
         var commitIds = allobjects.Where(r => r[1] == "commit").Select(r => r[0]).ToList();
-        //var commitIds = splitNewlineTerminated(git("rev-list", "--all"));
+        Console.WriteLine($"Found {commitIds.Count} commit objects");
 
         Console.WriteLine($"Reading every commit...");
-        var commits = commitIds.AsParallel().WithDegreeOfParallelism(10).Select(cid => Commit.ParseRawCommit(cid, git("cat-file", "-p", cid))).ToList();
+        var commits = commitIds.AsParallel().WithDegreeOfParallelism(10).Select(cid => Commit.ParseRawCommit(cid, git(InputRepo, "cat-file", "-p", cid))).ToList();
         Console.WriteLine($"Processing...");
         var nodes = commits.ToDictionary(c => c.Id, c => new CommitNode { Commit = c });
         foreach (var node in nodes.Values)
@@ -38,7 +70,6 @@ class Program
                 p.Children.Add(node);
         }
 
-        // find all commits from the "from" ref
         var discovered = new HashSet<CommitNode>();
         void discoverAdd(CommitNode n, bool withChildren)
         {
@@ -50,9 +81,10 @@ class Program
                 foreach (var c in n.Children)
                     discoverAdd(c, withChildren);
         }
-        discoverAdd(nodes[fromId], false);
         foreach (var r in allrefs)
             discoverAdd(nodes[r.id], false);
+        foreach (var id in fromIds)
+            discoverAdd(nodes[id], false);
 
         string msgpreview(IEnumerable<string> msg)
         {
@@ -65,31 +97,29 @@ class Program
         }
 
         // write out commits
-        if (true)
+        foreach (var c in discovered)
+            c.Commit.FileName = $"{time(c.Commit.AuthorTime):yyyy.MM.dd--HH.mm.sso<+HH.mm>}--{c.Commit.Id[..8]}--{msgpreview(c.Commit.Message)}";
+        Directory.CreateDirectory(OutputPath);
+        foreach (var c in discovered)
         {
-            foreach (var c in discovered)
-                c.Commit.FileName = $"{time(c.Commit.AuthorTime):yyyy.MM.dd--HH.mm.sso<+HH.mm>}--{c.Commit.Id[..8]}--{msgpreview(c.Commit.Message)}";
-            Directory.CreateDirectory(to);
-            foreach (var c in discovered)
-            {
-                Console.WriteLine($"Writing {c.Commit.FileName}");
-                var path = Path.Combine(to, c.Commit.FileName);
-                Directory.CreateDirectory(path);
-                git("worktree", "add", Path.Combine(path, "temptree"), c.Commit.Id);
-                Directory.Move(Path.Combine(path, "temptree"), Path.Combine(path, "tree"));
-                File.Delete(Path.Combine(path, "tree", ".git"));
-                git("worktree", "prune");
-                var commitstr = new StringBuilder();
-                //commitstr.AppendLine($"tree {c.Commit.Tree}");
-                foreach (var p in c.Parents)
-                    commitstr.AppendLine($"parent {p.Commit.FileName}");
-                commitstr.AppendLine($"author {c.Commit.Author}");
-                commitstr.AppendLine("");
-                foreach (var msg in c.Commit.Message)
-                    commitstr.AppendLine(msg);
-                File.WriteAllText(Path.Combine(path, "commit.txt"), commitstr.ToString());
-            }
+            Console.WriteLine($"Writing {c.Commit.FileName}");
+            var path = Path.Combine(OutputPath, c.Commit.FileName);
+            Directory.CreateDirectory(path);
+            git(InputRepo, "worktree", "add", Path.Combine(path, "temptree"), c.Commit.Id);
+            Directory.Move(Path.Combine(path, "temptree"), Path.Combine(path, "tree"));
+            File.Delete(Path.Combine(path, "tree", ".git"));
+            git(InputRepo, "worktree", "prune");
+            File.WriteAllText(Path.Combine(path, "message.txt"), c.Commit.Message.JoinString("\r\n"));
+            for (int pi = 0; pi < c.Parents.Count; pi++)
+                File.WriteAllText(Path.Combine(path, $"parent{pi}.txt"), c.Parents[pi].Commit.FileName);
+            File.WriteAllText(Path.Combine(path, "author.txt"), c.Commit.Author);
+            if (c.Commit.Committer != c.Commit.Author)
+                File.WriteAllText(Path.Combine(path, "committer.txt"), c.Commit.Committer);
+            if (c.Commit.CommitTime != c.Commit.AuthorTime)
+                File.WriteAllText(Path.Combine(path, "commit-time.txt"), $"{time(c.Commit.CommitTime):yyyy.MM.dd--HH.mm.sso<+HH.mm>}");
         }
+
+        return 0;
     }
 
     static OffsetDateTime time(Instant time)
@@ -103,14 +133,6 @@ class Program
         if (!lines.EndsWith("\n"))
             throw new Exception();
         return lines[..^1].Split('\n');
-    }
-
-    static string git(params string[] args)
-    {
-        var output = CommandRunner.Run(new[] { Git }.Concat(args).ToArray()).WithWorkingDirectory(Repo).OutputNothing().SuccessExitCodes(0).GoGetOutputText();
-        if (output.EndsWith("\r\n"))
-            throw new Exception();
-        return output;
     }
 }
 
@@ -127,7 +149,7 @@ class Commit
     public string Tree;
     public List<string> Parents = new();
     public string Author, Committer;
-    public Instant AuthorTime, CommitterTime;
+    public Instant AuthorTime, CommitTime;
     public List<string> Message = new();
     public string FileName;
 
@@ -166,7 +188,7 @@ class Commit
         match = Regex.Match(lines[cur], @"^committer (?<a>.*?) (?<ud>\d+) (?<tz>[+-]\d\d\d\d)$");
         if (!match.Success) throw new Exception();
         commit.Committer = match.Groups["a"].Value;
-        commit.CommitterTime = gtime(match);
+        commit.CommitTime = gtime(match);
         cur++;
 
         if (lines[cur].StartsWith("HG:"))

@@ -9,6 +9,7 @@
 
   <ItemGroup>
     <PackageReference Include="NodaTime" Version="3.1.9" />
+    <PackageReference Include="RT.CommandLine" Version="2.0.1748" />
     <PackageReference Include="RT.Util.Core" Version="2.0.1748" />
   </ItemGroup>
 
