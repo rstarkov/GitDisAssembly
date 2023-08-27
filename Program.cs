@@ -24,12 +24,20 @@ abstract class CmdLine
 {
     [Option("-ge", "--git-executable")]
     public string GitExe = @"C:\Apps\Git\cmd\git.exe";
+    [Option("--auto-crlf")]
+    [DocumentationLiteral("Enables line ending normalisation (by default GitDisAssemble preserves them as-is)")]
+    public bool AutoCrLf = false;
 
     public abstract int Execute();
 
     protected string git(string repo, params string[] args)
     {
-        var output = CommandRunner.Run(new[] { GitExe }.Concat(args).ToArray()).WithWorkingDirectory(repo).OutputNothing().SuccessExitCodes(0).GoGetOutputText();
+        var arglist = new List<string>();
+        arglist.Add(GitExe);
+        arglist.Add("-c");
+        arglist.Add("core.autocrlf=" + (AutoCrLf ? "true" : "false"));
+        arglist.AddRange(args);
+        var output = CommandRunner.Run(arglist.ToArray()).WithWorkingDirectory(repo).OutputNothing().SuccessExitCodes(0).GoGetOutputText();
         if (output.EndsWith("\r\n"))
             throw new Exception();
         return output;
