@@ -1,4 +1,4 @@
-﻿using System.Text.RegularExpressions;
+using System.Text.RegularExpressions;
 using NodaTime;
 using RT.CommandLine;
 using RT.Util;
@@ -46,7 +46,7 @@ class CmdDisassemble : CmdLine
     [IsPositional]
     public string[] AdditionalRefs = null;
 
-    // customization todo: folder name template; whether to use author or commit time for folders
+    // customization todo: folder name template; whether to use author or commit time for folders; zulu times + timezone
 
     public override int Execute()
     {
@@ -96,10 +96,20 @@ class CmdDisassemble : CmdLine
             return s.SubstringSafe(0, 20).Trim('.');
         }
 
-        // write out commits
+        // assign unique names that will replace commit hashes
         foreach (var c in discovered)
             c.Commit.FileName = $"{time(c.Commit.AuthorTime):yyyy.MM.dd--HH.mm.sso<+HH.mm>}--{c.Commit.Id[..8]}--{msgpreview(c.Commit.Message)}";
+
+        // write out refs
         Directory.CreateDirectory(OutputPath);
+        foreach (var r in allrefs)
+        {
+            var path = Path.Combine(OutputPath, r.rf);
+            Directory.CreateDirectory(Path.GetDirectoryName(path));
+            File.WriteAllText(path, nodes[r.id].Commit.FileName);
+        }
+
+        // write out commits
         foreach (var c in discovered)
         {
             Console.WriteLine($"Writing {c.Commit.FileName}");
