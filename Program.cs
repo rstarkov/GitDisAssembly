@@ -44,24 +44,39 @@ abstract class CmdLine
     }
 }
 
-[CommandName("dis", "d")]
+[CommandName("disassemble", "dis", "d")]
+[Documentation("Disassemble a git repository into files and directories describing each commit in full.")]
 class CmdDisassemble : CmdLine
 {
     [IsPositional]
+    [Documentation("Path to repository to disassemble.")]
     public string InputRepo = null;
     [IsPositional]
+    [Documentation("Path where the disassembled repository files are output.")]
     public string OutputPath = null;
     [IsPositional]
-    public string[] AdditionalRefs = null;
+    [Documentation("When discovering commits to include, start at these commits or refs and include all parent commits recursively.")]
+    public string[] AddRefs = null;
+    [Option("-ah", "--add-heads")]
+    [Documentation("When discovering commits to include, add all heads and include all parent commits recursively.")]
+    public bool AddHeads = false;
+    [Option("-at", "--add-tags")]
+    [Documentation("When discovering commits to include, add all tags and include all parent commits recursively.")]
+    public bool AddTags = false;
+    [Option("-ac", "--add-children")]
+    [Documentation("When discovering commits to include, also recursively include all child commits. You probably don't want this; instead make sure to include all the interesting heads and tags.")]
+    public bool AddChildren = false;
 
     // customization todo: folder name template; whether to use author or commit time for folders; zulu times + timezone
+    // todo: optionally don't disassemble trees, requiring reassembly into a repository that already has all the tree objects
 
     public override int Execute()
     {
         var allrefs = splitNewlineTerminated(git(InputRepo, "show-ref")).Select(r => (id: r.Split(' ')[0], rf: r.Split(' ')[1])).ToList();
         var ref2id = allrefs.ToDictionary(x => x.rf, x => x.id);
+        var allheads = allrefs.Where(x => x.rf.StartsWith("refs/heads/")).ToList();
+        var alltags = allrefs.Where(x => x.rf.StartsWith("refs/tags/")).ToList();
         Console.WriteLine($"Found {allrefs.Count} refs: " + allrefs.Select(x => x.rf).JoinString(", "));
-        var fromIds = AdditionalRefs.Select(r => ref2id.ContainsKey(r) ? ref2id[r] : r).ToList();
 
         var allobjects = splitNewlineTerminated(git(InputRepo, "cat-file", "--batch-check", "--batch-all-objects", "--unordered")).Select(r => r.Split(' ')).ToList();
         var commitIds = allobjects.Where(r => r[1] == "commit").Select(r => r[0]).ToList();
@@ -78,21 +93,36 @@ class CmdDisassemble : CmdLine
                 p.Children.Add(node);
         }
 
+        var addRefsNodes = new List<CommitNode>();
+        foreach (var addRef in AddRefs)
+        {
+            if (nodes.ContainsKey(addRef))
+                addRefsNodes.Add(nodes[addRef]);
+            else if (ref2id.ContainsKey(addRef))
+                addRefsNodes.Add(nodes[ref2id[addRef]]);
+            else
+                throw new Exception($"The value '{addRef}' passed to AddRefs is not a known commit or ref name. For refs, use full names (such as refs/heads/main).");
+        }
+
         var discovered = new HashSet<CommitNode>();
-        void discoverAdd(CommitNode n, bool withChildren)
+        void discoverAdd(CommitNode n)
         {
             if (!discovered.Add(n))
                 return;
             foreach (var p in n.Parents)
-                discoverAdd(p, withChildren);
-            if (withChildren)
+                discoverAdd(p);
+            if (AddChildren)
                 foreach (var c in n.Children)
-                    discoverAdd(c, withChildren);
+                    discoverAdd(c);
         }
-        foreach (var r in allrefs)
-            discoverAdd(nodes[r.id], false);
-        foreach (var id in fromIds)
-            discoverAdd(nodes[id], false);
+        foreach (var n in addRefsNodes)
+            discoverAdd(n);
+        if (AddHeads)
+            foreach (var x in allheads)
+                discoverAdd(nodes[x.id]);
+        if (AddTags)
+            foreach (var x in alltags)
+                discoverAdd(nodes[x.id]);
 
         string msgpreview(IEnumerable<string> msg)
         {
@@ -108,10 +138,12 @@ class CmdDisassemble : CmdLine
         foreach (var c in discovered)
             c.Commit.FileName = $"{time(c.Commit.AuthorTime):yyyy.MM.dd--HH.mm.sso<+HH.mm>}--{c.Commit.Id[..8]}--{msgpreview(c.Commit.Message)}";
 
-        // write out refs
+        // write out refs - just those that point at a discovered commit
         Directory.CreateDirectory(OutputPath);
         foreach (var r in allrefs)
         {
+            if (!discovered.Contains(nodes[r.id]))
+                continue;
             var path = Path.Combine(OutputPath, r.rf);
             Directory.CreateDirectory(Path.GetDirectoryName(path));
             File.WriteAllText(path, nodes[r.id].Commit.FileName);
@@ -127,6 +159,7 @@ class CmdDisassemble : CmdLine
             Directory.Move(Path.Combine(path, "temptree"), Path.Combine(path, "tree"));
             File.Delete(Path.Combine(path, "tree", ".git"));
             git(InputRepo, "worktree", "prune");
+
             File.WriteAllText(Path.Combine(path, "message.txt"), c.Commit.Message.JoinString("\r\n"));
             for (int pi = 0; pi < c.Parents.Count; pi++)
                 File.WriteAllText(Path.Combine(path, $"parent{pi}.txt"), c.Parents[pi].Commit.FileName);
