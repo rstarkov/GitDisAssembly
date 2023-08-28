@@ -1,8 +1,9 @@
-using System.Text.RegularExpressions;
+﻿using System.Text.RegularExpressions;
 using NodaTime;
 using NodaTime.Text;
 using RT.CommandLine;
 using RT.Util;
+using RT.Util.Consoles;
 using RT.Util.ExtensionMethods;
 
 namespace GitPatchDisAssemble;
@@ -11,12 +12,29 @@ class Program
 {
     static CmdLine Args;
 
-    static void Main(string[] args)
+    static int Main(string[] args)
     {
         Args = CommandLineParser.ParseOrWriteUsageToConsole<CmdLine>(args);
         if (Args == null)
-            return;
-        Args.Execute();
+            return -1;
+        try
+        {
+            return Args.Execute();
+        }
+        catch (TellUserException e)
+        {
+            ConsoleUtil.WriteLine("Error: ".Color(ConsoleColor.Red) + CommandLineParser.Colorize(RhoML.Parse(e.Message)));
+            return e.ExitCode;
+        }
+#if !DEBUG
+        catch (Exception e)
+        {
+            ConsoleUtil.WriteLine("Internal error: ".Color(ConsoleColor.Red) + e.Message);
+            ConsoleUtil.WriteLine(e.GetType().FullName);
+            ConsoleUtil.WriteLine(e.StackTrace);
+            return -99;
+        }
+#endif
     }
 }
 
@@ -49,7 +67,7 @@ abstract class CmdLine
             throw new Exception($"Git command exited with status {runner.ExitCode}: " + runner.Command + "\r\n" + runner.EntireStderr.FromUtf8());
         var output = runner.EntireStdout.FromUtf8();
         if (output.EndsWith("\r\n"))
-            throw new Exception();
+            throw new Exception("Unexpected \\r\\n");
         return output;
     }
 }
@@ -94,7 +112,6 @@ class CmdDisassemble : CmdLine
 
         Console.WriteLine($"Reading every commit...");
         var commits = commitIds.AsParallel().WithDegreeOfParallelism(10).Select(cid => Commit.ParseRawCommit(cid, git(InputRepo, null, "cat-file", "-p", cid))).ToList();
-        Console.WriteLine($"Processing...");
         var nodes = commits.ToDictionary(c => c.Id, c => new CommitNode { Commit = c });
         foreach (var node in nodes.Values)
         {
@@ -111,7 +128,7 @@ class CmdDisassemble : CmdLine
             else if (ref2id.ContainsKey(addRef))
                 addRefsNodes.Add(nodes[ref2id[addRef]]);
             else
-                throw new Exception($"The value '{addRef}' passed to AddRefs is not a known commit or ref name. For refs, use full names (such as refs/heads/main).");
+                throw new TellUserException(1, $"The value {{h}}{addRef}{{}} passed to {{field}}AddRefs{{}} is not a known commit or ref name. For refs, use full names (such as {{h}}refs/heads/main{{}}).");
         }
 
         var discovered = new HashSet<CommitNode>();
@@ -160,6 +177,7 @@ class CmdDisassemble : CmdLine
         }
 
         // write out commits
+        Console.WriteLine($"Writing {discovered.Count} commits...");
         foreach (var c in discovered)
         {
             Console.WriteLine($"Writing {c.Commit.DirName}");
@@ -187,7 +205,7 @@ class CmdDisassemble : CmdLine
     {
         if (lines == "") return new string[0];
         if (!lines.EndsWith("\n"))
-            throw new Exception();
+            throw new Exception("Expected a newline");
         return lines[..^1].Split('\n');
     }
 }
@@ -220,18 +238,18 @@ class CmdAssemble : CmdLine
             var commit = node.Commit;
             var parsed = Regex.Match(commit.DirName, @"^(?<tm>\d\d\d\d\.\d\d\.\d\d--\d\d\.\d\d\.\d\d[+-]\d\d\.\d\d)--");
             if (!parsed.Success)
-                throw new Exception("Cannot parse commit directory name: " + commit.DirName);
+                throw new TellUserException(1, $"Cannot parse commit directory name: {{h}}{commit.DirName}{{}}");
             commit.AuthorTime = timePattern.Parse(parsed.Groups["tm"].Value).Value;
             commit.Author = read(commit.DirName, "author.txt");
             commit.Committer = read(commit.DirName, "committer.txt") ?? commit.Author;
             commit.Author ??= commit.Committer;
-            if (commit.Author == null) throw new Exception("No author for commit: " + commit.DirName);
+            if (commit.Author == null) throw new TellUserException(1, $"No author for commit {{h}}{commit.DirName}{{}}.");
             for (int i = 0; ; i++)
             {
                 var parent = read(commit.DirName, $"parent{i}.txt");
                 if (parent == null) break;
                 commit.Parents.Add(parent);
-                if (!nodes.ContainsKey(parent)) throw new Exception($"Cannot resolve commit name '{parent}' used by parent{i} of '{commit.DirName}'.");
+                if (!nodes.ContainsKey(parent)) throw new TellUserException(1, $"Cannot resolve commit name {{h}}{parent}{{}} used by {{h}}parent{i}{{}} of {{h}}{commit.DirName}{{}}.");
                 node.Parents.Add(nodes[parent]);
                 nodes[parent].Children.Add(node);
             }
@@ -240,7 +258,7 @@ class CmdAssemble : CmdLine
                 commit.CommitTime = commit.AuthorTime;
             else
                 commit.CommitTime = timePattern.Parse(commitTime).Value;
-            commit.Message = read(commit.DirName, "message.txt")?.Split("\r\n", "\n").ToList() ?? throw new Exception("No commit message for commit: " + commit.DirName);
+            commit.Message = read(commit.DirName, "message.txt")?.Split("\r\n", "\n").ToList() ?? throw new TellUserException(1, $"No commit message for commit {{h}}{commit.DirName}{{}}.");
         }
         // Parse refs
         var refs = new List<(string name, CommitNode node)>();
@@ -251,7 +269,7 @@ class CmdAssemble : CmdLine
             {
                 var reftarget = read(dir.FullName, f.Name);
                 var refname = name + "/" + f.Name;
-                if (!nodes.ContainsKey(reftarget)) throw new Exception($"Cannot resolve commit name '{reftarget}' used by '{refname}'.");
+                if (!nodes.ContainsKey(reftarget)) throw new TellUserException(1, $"Cannot resolve commit name {{h}}{reftarget}{{}} used by {{h}}{refname}{{}}.");
                 refs.Add((refname, nodes[reftarget]));
             }
             foreach (var d in dir.EnumerateDirectories())
@@ -282,7 +300,7 @@ class CmdAssemble : CmdLine
         foreach (var node in sorted)
         {
             Console.WriteLine("Writing commit " + node.Commit.DirName);
-            // Copy and commit tree
+            // Copy and commit tree - TODO: git 2.42 supports creating a worktree on an orphan branch, so we can use worktrees and bypass all the copying
             cleanWorkdir(OutputRepo);
             File.Delete(Path.Combine(OutputRepo, ".git", "index")); // force add -A to rebuild the index - otherwise we get wrong trees sometimes!
             copyContents(new DirectoryInfo(Path.Combine(InputPath, node.Commit.DirName, "tree")), new DirectoryInfo(OutputRepo));
@@ -293,7 +311,7 @@ class CmdAssemble : CmdLine
             lines.Add("tree " + treeId);
             foreach (var parent in node.Parents)
             {
-                if (parent.Commit.Id == null) throw new Exception();
+                if (parent.Commit.Id == null) throw new Exception("Expected commit ID to be known");
                 lines.Add("parent " + parent.Commit.Id);
             }
             lines.Add($"author {node.Commit.Author} {node.Commit.AuthorTime.ToInstant().ToUnixTimeSeconds()} {node.Commit.AuthorTime:o<+HHmm>}");
@@ -365,7 +383,7 @@ class Commit
         var lines = raw.Split(new[] { "\n" }, StringSplitOptions.None);
         int cur = 0;
 
-        if (!lines[cur].StartsWith("tree ")) throw new Exception();
+        if (!lines[cur].StartsWith("tree ")) throw new Exception("Expected 'tree'");
         commit.Tree = lines[cur][5..];
         cur++;
 
@@ -375,16 +393,16 @@ class Commit
             cur++;
         }
 
-        if (!lines[cur].StartsWith("author ")) throw new Exception();
+        if (!lines[cur].StartsWith("author ")) throw new Exception("Expected 'author'");
         var match = Regex.Match(lines[cur], @"^author (?<a>.*?) (?<ud>\d+) (?<tz>[+-]\d\d\d\d)$");
-        if (!match.Success) throw new Exception();
+        if (!match.Success) throw new Exception("Couldn't parse 'author'");
         commit.Author = match.Groups["a"].Value;
         commit.AuthorTime = gtime(match);
         cur++;
 
-        if (!lines[cur].StartsWith("committer ")) throw new Exception();
+        if (!lines[cur].StartsWith("committer ")) throw new Exception("Expected 'committer'");
         match = Regex.Match(lines[cur], @"^committer (?<a>.*?) (?<ud>\d+) (?<tz>[+-]\d\d\d\d)$");
-        if (!match.Success) throw new Exception();
+        if (!match.Success) throw new Exception("Couldn't parse 'committer'");
         commit.Committer = match.Groups["a"].Value;
         commit.CommitTime = gtime(match);
         cur++;
@@ -392,12 +410,21 @@ class Commit
         if (lines[cur].StartsWith("HG:"))
             cur++;
 
-        if (lines[cur] != "") throw new Exception();
+        if (lines[cur] != "") throw new Exception("Expected blank line after all known commit properties");
         cur++;
 
         for (int c = cur; c < lines.Length; c++)
             commit.Message.Add(lines[c]);
 
         return commit;
+    }
+}
+
+class TellUserException : Exception
+{
+    public int ExitCode { get; private set; }
+    public TellUserException(int exitcode, string message) : base(message)
+    {
+        ExitCode = exitcode;
     }
 }
