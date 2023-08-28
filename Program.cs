@@ -1,4 +1,4 @@
-using System.Text.RegularExpressions;
+﻿using System.Text.RegularExpressions;
 using NodaTime;
 using NodaTime.Text;
 using RT.CommandLine;
@@ -113,7 +113,12 @@ class CmdDisassemble : CmdLine
         var ref2id = allrefs.ToDictionary(x => x.rf, x => x.id);
         var allheads = allrefs.Where(x => x.rf.StartsWith("refs/heads/")).ToList();
         var alltags = allrefs.Where(x => x.rf.StartsWith("refs/tags/")).ToList();
-        Console.WriteLine($"Found {allrefs.Count} refs: " + allrefs.Select(x => x.rf).JoinString(", "));
+        ConsoleColoredString fmtRefList(IEnumerable<string> strs) => strs.Count() == 0 ? "" : (": " + strs.Take(4).Select(r => r.Color(ConsoleColor.Cyan)).JoinColoredString(", ") + (strs.Count() > 4 ? ", etc" : ""));
+        ConsoleUtil.WriteLine($"Found {allheads.Count} heads" + fmtRefList(allheads.Select(x => x.rf)));
+        ConsoleUtil.WriteLine($"Found {alltags.Count} tags" + fmtRefList(alltags.Select(x => x.rf)));
+        var otherrefs = allrefs.Select(x => x.rf).Except(allheads.Select(x => x.rf)).Except(alltags.Select(x => x.rf)).ToList();
+        if (otherrefs.Count > 0)
+            ConsoleUtil.WriteLine($"Found {otherrefs.Count} other refs" + fmtRefList(otherrefs));
 
         var allobjects = splitNewlineTerminated(git(InputRepo, null, "cat-file", "--batch-check", "--batch-all-objects", "--unordered")).Select(r => r.Split(' ')).ToList();
         var commitIds = allobjects.Where(r => r[1] == "commit").Select(r => r[0]).ToList();
