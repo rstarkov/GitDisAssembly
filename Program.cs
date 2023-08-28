@@ -1,14 +1,15 @@
-﻿using System.Text.RegularExpressions;
+using System.Text.RegularExpressions;
 using NodaTime;
 using NodaTime.Text;
 using RT.CommandLine;
 using RT.Util;
 using RT.Util.Consoles;
 using RT.Util.ExtensionMethods;
+using static GitDisAssemble.Program;
 
-namespace GitPatchDisAssemble;
+namespace GitDisAssemble;
 
-class Program
+static class Program
 {
     static CmdLine Args;
 
@@ -23,18 +24,26 @@ class Program
         }
         catch (TellUserException e)
         {
-            ConsoleUtil.WriteLine("Error: ".Color(ConsoleColor.Red) + CommandLineParser.Colorize(RhoML.Parse(e.Message)));
+            Console.WriteLine();
+            ConsoleUtil.WriteLine("Error: ".Color(ConsoleColor.Red) + C(e.Message));
             return e.ExitCode;
         }
 #if !DEBUG
         catch (Exception e)
         {
+            Console.WriteLine();
             ConsoleUtil.WriteLine("Internal error: ".Color(ConsoleColor.Red) + e.Message);
             ConsoleUtil.WriteLine(e.GetType().FullName);
             ConsoleUtil.WriteLine(e.StackTrace);
             return -99;
         }
 #endif
+    }
+
+    public static ConsoleColoredString C(string commandLineColoredRhoML)
+    {
+        // colors: refs=cyan, commit names=yellow, commit ids=green
+        return CommandLineParser.Colorize(RhoML.Parse(commandLineColoredRhoML));
     }
 }
 
@@ -128,7 +137,7 @@ class CmdDisassemble : CmdLine
             else if (ref2id.ContainsKey(addRef))
                 addRefsNodes.Add(nodes[ref2id[addRef]]);
             else
-                throw new TellUserException(1, $"The value {{h}}{addRef}{{}} passed to {{field}}AddRefs{{}} is not a known commit or ref name. For refs, use full names (such as {{h}}refs/heads/main{{}}).");
+                throw new TellUserException(1, $"The value {{h}}{addRef}{{}} passed to {{field}}AddRefs{{}} is not a known commit or ref name. For refs, use full names (such as {{cyan}}refs/heads/main{{}}).");
         }
 
         var discovered = new HashSet<CommitNode>();
@@ -180,7 +189,7 @@ class CmdDisassemble : CmdLine
         Console.WriteLine($"Writing {discovered.Count} commits...");
         foreach (var c in discovered)
         {
-            Console.WriteLine($"Writing {c.Commit.DirName}");
+            ConsoleUtil.WriteLine(C($"Writing {{yellow}}{c.Commit.DirName}{{}}"));
             var path = Path.Combine(OutputPath, c.Commit.DirName);
             Directory.CreateDirectory(path);
             git(InputRepo, null, "worktree", "add", Path.Combine(path, "temptree"), c.Commit.Id);
@@ -238,18 +247,18 @@ class CmdAssemble : CmdLine
             var commit = node.Commit;
             var parsed = Regex.Match(commit.DirName, @"^(?<tm>\d\d\d\d\.\d\d\.\d\d--\d\d\.\d\d\.\d\d[+-]\d\d\.\d\d)--");
             if (!parsed.Success)
-                throw new TellUserException(1, $"Cannot parse commit directory name: {{h}}{commit.DirName}{{}}");
+                throw new TellUserException(1, $"Cannot parse commit directory name: {{yellow}}{commit.DirName}{{}}");
             commit.AuthorTime = timePattern.Parse(parsed.Groups["tm"].Value).Value;
             commit.Author = read(commit.DirName, "author.txt");
             commit.Committer = read(commit.DirName, "committer.txt") ?? commit.Author;
             commit.Author ??= commit.Committer;
-            if (commit.Author == null) throw new TellUserException(1, $"No author for commit {{h}}{commit.DirName}{{}}.");
+            if (commit.Author == null) throw new TellUserException(1, $"No author for commit {{yellow}}{commit.DirName}{{}}.");
             for (int i = 0; ; i++)
             {
                 var parent = read(commit.DirName, $"parent{i}.txt");
                 if (parent == null) break;
                 commit.Parents.Add(parent);
-                if (!nodes.ContainsKey(parent)) throw new TellUserException(1, $"Cannot resolve commit name {{h}}{parent}{{}} used by {{h}}parent{i}{{}} of {{h}}{commit.DirName}{{}}.");
+                if (!nodes.ContainsKey(parent)) throw new TellUserException(1, $"Cannot resolve commit name {{yellow}}{parent}{{}} used by {{h}}parent{i}{{}} of {{yellow}}{commit.DirName}{{}}.");
                 node.Parents.Add(nodes[parent]);
                 nodes[parent].Children.Add(node);
             }
@@ -258,7 +267,7 @@ class CmdAssemble : CmdLine
                 commit.CommitTime = commit.AuthorTime;
             else
                 commit.CommitTime = timePattern.Parse(commitTime).Value;
-            commit.Message = read(commit.DirName, "message.txt")?.Split("\r\n", "\n").ToList() ?? throw new TellUserException(1, $"No commit message for commit {{h}}{commit.DirName}{{}}.");
+            commit.Message = read(commit.DirName, "message.txt")?.Split("\r\n", "\n").ToList() ?? throw new TellUserException(1, $"No commit message for commit {{yellow}}{commit.DirName}{{}}.");
         }
         // Parse refs
         var refs = new List<(string name, CommitNode node)>();
@@ -269,7 +278,7 @@ class CmdAssemble : CmdLine
             {
                 var reftarget = read(dir.FullName, f.Name);
                 var refname = name + "/" + f.Name;
-                if (!nodes.ContainsKey(reftarget)) throw new TellUserException(1, $"Cannot resolve commit name {{h}}{reftarget}{{}} used by {{h}}{refname}{{}}.");
+                if (!nodes.ContainsKey(reftarget)) throw new TellUserException(1, $"Cannot resolve commit name {{yellow}}{reftarget}{{}} used by {{cyan}}{refname}{{}}.");
                 refs.Add((refname, nodes[reftarget]));
             }
             foreach (var d in dir.EnumerateDirectories())
@@ -299,7 +308,7 @@ class CmdAssemble : CmdLine
         }
         foreach (var node in sorted)
         {
-            Console.WriteLine("Writing commit " + node.Commit.DirName);
+            ConsoleUtil.Write(C($"Writing commit {{yellow}}{node.Commit.DirName}{{}}..."));
             // Copy and commit tree - TODO: git 2.42 supports creating a worktree on an orphan branch, so we can use worktrees and bypass all the copying
             cleanWorkdir(OutputRepo);
             File.Delete(Path.Combine(OutputRepo, ".git", "index")); // force add -A to rebuild the index - otherwise we get wrong trees sometimes!
@@ -320,12 +329,15 @@ class CmdAssemble : CmdLine
             lines.AddRange(node.Commit.Message);
             // Write commit object
             node.Commit.Id = git(OutputRepo, lines.JoinString("\n").ToUtf8(), "hash-object", "-t", "commit", "-w", "--stdin").Trim();
-            Console.WriteLine("    " + node.Commit.Id);
+            ConsoleUtil.WriteLine(C($" {{green}}{node.Commit.Id.SubstringSafe(0, 8)}{{}}"));
         }
         // Write refs
         Console.WriteLine("Writing refs...");
         foreach (var r in refs)
+        {
+            ConsoleUtil.WriteLine(C($"    {{cyan}}{r.name}{{}} -> {{green}}{r.node.Commit.Id.SubstringSafe(0, 8)}{{}}"));
             git(OutputRepo, null, "update-ref", r.name, r.node.Commit.Id);
+        }
 
         void cleanWorkdir(string path)
         {
