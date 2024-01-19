@@ -382,6 +382,7 @@ class Commit
     public List<string> Parents = new();
     public string Author, Committer;
     public OffsetDateTime AuthorTime, CommitTime;
+    public List<string> GpgSig;
     public List<string> Message = new();
     public string DirName;
 
@@ -426,6 +427,25 @@ class Commit
 
         if (lines[cur].StartsWith("HG:"))
             cur++;
+
+        if (lines[cur] == "gpgsig -----BEGIN PGP SIGNATURE-----")
+        {
+            Console.WriteLine("Found gpgsig; this won't be preserved. Reassembly of affected commit will not have the signature.");
+            commit.GpgSig = new();
+            while (true)
+            {
+                commit.GpgSig.Add(lines[cur]);
+                if (lines[cur] == " -----END PGP SIGNATURE-----")
+                {
+                    cur++;
+                    if (lines[cur] != " ") throw new Exception("Expected blank line with a space after end pgp signature");
+                    commit.GpgSig.Add(lines[cur]);
+                    cur++;
+                    break;
+                }
+                cur++;
+            }
+        }
 
         if (lines[cur] != "") throw new Exception("Expected blank line after all known commit properties");
         cur++;
