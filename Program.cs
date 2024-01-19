@@ -1,4 +1,4 @@
-using System.Text.RegularExpressions;
+﻿using System.Text.RegularExpressions;
 using NodaTime;
 using NodaTime.Text;
 using RT.CommandLine;
@@ -103,6 +103,9 @@ class CmdDisassemble : CmdLine
     [Option("-ac", "--add-children")]
     [Documentation("When discovering commits to include, also recursively include all child commits. You probably don't want this; instead make sure to include all the interesting heads and tags.")]
     public bool AddChildren = false;
+    [Option("-nd", "--no-discover")]
+    [Documentation("Disable commit discovery and disassemble only the exact commits specified via other options")]
+    public bool NoDiscover = false;
 
     // customization todo: folder name template; whether to use author or commit time for folders; zulu times + timezone
     // todo: optionally don't disassemble trees, requiring reassembly into a repository that already has all the tree objects
@@ -149,6 +152,8 @@ class CmdDisassemble : CmdLine
         void discoverAdd(CommitNode n)
         {
             if (!discovered.Add(n))
+                return;
+            if (NoDiscover)
                 return;
             foreach (var p in n.Parents)
                 discoverAdd(p);
