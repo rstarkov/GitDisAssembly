@@ -1,4 +1,4 @@
-﻿using System.Text.RegularExpressions;
+using System.Text.RegularExpressions;
 using NodaTime;
 using NodaTime.Text;
 using RT.CommandLine;
@@ -183,7 +183,7 @@ class CmdDisassemble : CmdLine
         Directory.CreateDirectory(OutputPath);
         foreach (var r in allrefs)
         {
-            if (!discovered.Contains(nodes[r.id]))
+            if (!nodes.ContainsKey(r.id) /* eg subrepos */ || !discovered.Contains(nodes[r.id]))
                 continue;
             var path = Path.Combine(OutputPath, r.rf);
             Directory.CreateDirectory(Path.GetDirectoryName(path));
